@@ -1,0 +1,183 @@
+#This is a powershell script to perform inplace upgrade SQL server 2019.
+#Built by: Vinod Prasanth
+#Version:2
+#date:18-March-2020
+
+Import-Module FailoverClusters
+Import-Module sqlps
+
+##STEP1 - Environment Input
+$AGListenername = Read-Host -Prompt 'Enter the AG Listener name'
+$Distributor = Read-Host -Prompt 'Enter the Remote distribution servername'
+$Subscriber = Read-Host -Prompt 'Enter the Remote subscriber servername'
+$service_acct = Read-Host -Prompt 'Enter the service account' 
+$service_pass =  Read-Host -AsSecurestring -Prompt "Enter password for $service_acct"  
+$version = "SQL Server 2019"
+$location = "\\$server\E$\"
+
+##SQL Query to get the replicas
+$GetReplicas=@"
+                SELECT RCS.replica_server_name, ARS.role_desc, name 
+                FROM sys.availability_groups_cluster AS AGC
+                INNER JOIN sys.dm_hadr_availability_replica_cluster_states AS RCS
+                ON RCS.group_id = AGC.group_id
+                INNER JOIN sys.dm_hadr_availability_replica_states AS ARS
+                ON ARS.replica_id = RCS.replica_id
+"@
+
+##SQL Query to change SYNCHRONOUS_COMMIT for $DRNode2
+$AGSyncQuery=@"
+USE [master]
+GO
+ALTER AVAILABILITY GROUP [AG_Group_Name]
+MODIFY REPLICA ON N'$DRNode2' WITH (AVAILABILITY_MODE = SYNCHRONOUS_COMMIT)
+GO
+"@
+
+##SQL Query to STOP and START Replication. 
+$Repl_Stop_query=@"
+exec distribution.dbo.sp_MSstopdistribution_agent @publisher  = $FCICluster,
+@publisher_db   = 'PUB_DBName',
+@publication    = 'TABLE_EMPLOYEE',
+@subscriber     = 'SUBSCRIBERSERVER',
+@subscriber_db  = 'WAREHOUSEDB'
+"@
+$Repl_Start_query=@"
+exec distribution.dbo.sp_MSstartdistribution_agent @publisher  = $FCICluster,
+@publisher_db   = 'PUB_DBName',
+@publication    = 'TABLE_EMPLOYEE',
+@subscriber     = 'SUBSCRIBERSERVER',
+@subscriber_db  = 'WAREHOUSEDB'
+"@
+
+##Call the DB Backup JOB to take fullbackup of system and user dbs
+$fullbackup=@"
+USE msdb ;  
+GO    
+EXEC dbo.sp_start_job N'DB Full backup' ;  
+GO 
+"@
+
+invoke-sqlcmd -ServerInstance "$AGListenername" -query $fullbackup
+
+##STEP 2 - STOP Replication upgrade the Remote Distributor and Subscriber and START Replication. 
+$Repl_Stop = invoke-sqlcmd -ServerInstance "$AGListenername" -databse 'disrtibution' -query $Repl_Stop_query
+##To Upgrade Remote Distributor and Subscriber SQL 2019
+SQL_Server_Upgrade -server $Distributor -service_acc $service_acct -service_pass $service_pass -location $location
+SQL_Server_Upgrade -server $Subscriber -service_acc $service_acct -service_pass $service_pass -location $location
+$Repl_Start = invoke-sqlcmd -ServerInstance "$AGListenername" -databse 'disrtibution' -query $Repl_Start_query
+
+
+##STEP3 - Initializing all the node names and replicas to a variable
+$replicas= invoke-sqlcmd -ServerInstance "$AGListenername" -query $GetReplicas
+$FCICluster= ($replicas|?{ $_.role_desc -eq "Primary"}).replica_server_name
+$DRNode1= ($replicas|?{ $_.role_desc -eq "Primary"}).replica_server_name
+$DRNode2= ($replicas|?{ $_.role_desc -eq "Secondary"}).replica_server_name
+$DRNode3= ($replicas|?{ $_.role_desc -ne "Primary" -and "Secondary"}).replica_server_name
+$FCInode1= Get-ClusterResource -Cluster $FCICluster | (?{$_.OwnerGroup -like "SQL Server *node-1*"}).OwnerNode
+$FCInode2= Get-ClusterResource -Cluster $FCICluster | (?{$_.OwnerGroup -like "SQL Server *node-2*"}).OwnerNode
+$FCInode3= Get-ClusterResource -Cluster $FCICluster | (?{$_.OwnerGroup -like "SQL Server *node-3*"}).OwnerNode
+
+
+##Function to copy SQL binaries from repo to all the nodes
+Function Copy_SQL_binaries
+{
+Param
+([string]$server,$version)
+Try
+{
+	Write-Host -Foregroundcolor Green "Copying SQL Server Binaries"
+	$copy_cmd =  "\\Remote server\SQL_Server_$version"
+    Copy-Item $copy_cmd \\$server\E$\ -recurse -force;
+	Write-Host -Foregroundcolor Green "SQL binaries copied successfully"
+}
+Catch
+{
+	Write-Host -Foregroundcolour RED "Media copy failed"
+    exit
+}
+}
+
+Copy_SQL_binaries -server $DRNode1 -version $version 
+Copy_SQL_binaries -server $DRNode2 -version $version 
+Copy_SQL_binaries -server $DRNode3 -version $version 
+Copy_SQL_binaries -server $FCICluster -version $version 
+
+##Function to do inplace upgrade
+Function SQL_Server_Upgrade
+{
+Param
+([string]$server,[string]$service_acct, [string]$service_pass,[string]$location)
+	Write-Host -Foregroundcolor Green "SQL Server Upgrade is in progress"
+	$host_name  = hostname
+    if ($server -eq $host_name) #Upgrade when RDP to the server#
+    {
+	    Try
+	    { 
+            Set-location $location ; ./setup.exe /q /ACTION=upgrade /INSTANCENAME = $hostname /SQLSVCACCOUNT=$service_acct /SQLSVCPASSWORD=$service_pass /AGTSVCACCOUNT= $service_acct /AGTSVCPASSWORD= $service_pass /FTSVCACCOUNT=$service_acct /FTSVCPASSWORD=$service_pass  /IAcceptSQLServerLicenseTerms;
+        }
+	    Catch
+	    {      
+            $_.Exception.Message      
+		    Write-Host -Foregroundcolor Red "SQL Server Upgrade failed, Go to summary.txt in setupbootstrap folder"
+		    EXIT
+	    }
+    }
+    else #Upgrade when executing from remote server#
+    {
+        Try
+	    {
+            $script_upgrade = { 
+            param 
+            (
+            $service_acct, $service_pass, $location
+            ) Set-location $location ; ./setup.exe /q /ACTION=upgrade /INSTANCENAME = $hostname /SQLSVCACCOUNT=$service_acct /SQLSVCPASSWORD=$service_pass /AGTSVCACCOUNT= $service_acct /AGTSVCPASSWORD= $service_pass /FTSVCACCOUNT=$service_acct /FTSVCPASSWORD=$service_pass  /IAcceptSQLServerLicenseTerms;}
+		
+		    invoke-command -computername "$server" -scriptblock $script_upgrade -ArgumentList $service_acct, $service_pass, $location -ErrorAction Stop
+	    }
+	    Catch
+	    {      
+            $_.Exception.Message      
+		    Write-Host -Foregroundcolor Red "SQL Server Upgrade failed, Go to summary.txt in setupbootstrap folder"
+		    EXIT
+	    }
+
+    }
+
+}
+
+##STEP4 - To Upgrade Read Replica DRNode3 -ASYNC
+SQL_Server_Upgrade -server $DRNode3 -service_acc $service_acct -service_pass $service_pass -location $location
+
+##STEP5 - Chance $DRNode2 SYNCHRONOUS_COMMIT so that Read load can be directed to this node when we upgrade DRNode1
+$AG_sync = invoke-sqlcmd -ServerInstance "$AGListenername" -query $AGSyncQuery
+
+##STEP6 - To Upgrade Read Replica DRNode2 -SYNC
+SQL_Server_Upgrade -server $DRNode2 -service_acc $service_acct -service_pass $service_pass -location $location
+
+##STEP7 - To Upgrade Read Replica DRNode1 -SYNC
+SQL_Server_Upgrade -server $DRNode1 -service_acc $service_acct -service_pass $service_pass -location $location
+
+##STEP8/9 - To Upgrade FCI Node3
+SQL_Server_Upgrade -server $FCInode3 -service_acc $service_acct -service_pass $service_pass -location $location
+
+##STEP10/11 - To Upgrade FCI Node2
+SQL_Server_Upgrade -server $FCInode2 -service_acc $service_acct -service_pass $service_pass -location $location
+
+
+##STEP12 - Moving the cluster node $FCInode1 to $FCInode2
+Move-ClusterGroup $FCInode1 -Cluster $FCICluster -Node $FCInode2
+
+##STEP14 - Execute the sp_vupgrade_replication on $FCInode2 the newly upgraded SQL 2019 
+$Repl_Qry= 'EXECUTE [master].[sys].[sp_vupgrade_replication]'
+$Repl_Vupgrade = invoke-sqlcmd -ServerInstance "$FCICluster" -query $Repl_Qry
+
+##STEP15 - To Upgrade FCI Node1 - Currently Passive node
+SQL_Server_Upgrade -server $FCInode1 -service_acc $service_acct -service_pass $service_pass -location $location
+
+##To display AG Sync status between the nodes
+$srv = New-Object Microsoft.SqlServer.Management.Smo.Server $AGListenername
+$AG = $srv.AvailabilityGroups[$AG_Group_Name]
+$AG.DatabaseReplicaStates|ft -AutoSize 
+$EndDate = Get-Date
+$Time = $EndDate - $StartDate  
